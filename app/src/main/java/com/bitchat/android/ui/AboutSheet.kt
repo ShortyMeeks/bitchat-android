@@ -81,6 +81,10 @@ import com.bitchat.android.ui.theme.BitchatMotion
 import com.bitchat.android.ui.theme.LocalBitchatPalette
 import com.bitchat.android.util.ShareableApkVariant
 import com.bitchat.android.util.UniversalApkManager
+import androidx.compose.ui.tooling.preview.Preview
+import com.bitchat.android.ui.theme.BitchatTheme
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
 
 /**
  * Theme selection chip with Apple-like styling
@@ -307,7 +311,7 @@ fun AboutSheet(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    
+
     // Get version name from package info
     val versionName = remember {
         try {
