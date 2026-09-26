@@ -12,10 +12,16 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.AnimationSpec
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FiniteAnimationSpec
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.VisibilityThreshold
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -59,7 +65,11 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
@@ -106,6 +116,29 @@ import java.util.Locale
 /**
  * Message display components for ChatScreen
  * Extracted from ChatScreen.kt for better organization
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * REDESIGN (ui/beautify branch) — qué cambió y por qué:
+ * ────────────────────────────────────────────────────────────────────────────
+ * 1. `DeliveryStatusIcon` migró de `colorScheme.primary` (que ahora es azul por
+ *    el cambio de tema) a los tokens semánticos de `BitchatPalette`:
+ *      - `messageSent`      (azul)  → mensaje aceptado por el transporte
+ *      - `messageDelivered` (verde) → confirmación end-to-end
+ *      - `messageFailed`    (rojo)  → fallo tras reintentos
+ *    Antes del rediseño, `primary` era verde y "entregado" se veía verde por
+ *    casualidad semántica. Al volver `primary` azul, se pierde esa asociación
+ *    y hay que recuperarla con tokens explícitos.
+ * 2. NUEVO: `DeliverySendingSpinner` — un spinner circular de 10dp que sustituye
+ *    a los dos cheques grises ambiguos cuando un mensaje propio aún no tiene
+ *    `deliveryStatus`. Antes los dos cheques se veían estáticos en gris, sin
+ *    comunicar "en vuelo".
+ * 3. Nuevo helper `deliveryCheckColors()` que consulta `LocalBitchatPalette`
+ *    directamente en vez de depender de `colorScheme.primary`.
+ * 4. Sin cambios: MessageArrivalTracker, MessageGrouping, animaciones de
+ *    entrada/placement, BubbleTextMessageLayout, BubbleMetaPlan,
+ *    TextMessageLayout, CashuPaymentChip, layout general del LazyColumn.
+ * 5. Sin cambios: colorForPeer() — sigue siendo byte-identical con iOS.
+ * ────────────────────────────────────────────────────────────────────────────
  */
 
 /** How far a newly arrived message travels up into place. */
@@ -249,7 +282,7 @@ fun MessagesList(
     // Track if this is the first time messages are being loaded
     var hasScrolledToInitialPosition by remember(conversationKey) { mutableStateOf(false) }
     var followIncomingMessages by remember(conversationKey) { mutableStateOf(true) }
-    
+
     // Smart scroll: auto-scroll to bottom for initial load, then follow unless user scrolls away
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) {
@@ -262,7 +295,7 @@ fun MessagesList(
             }
         }
     }
-    
+
     // Track whether user has scrolled away from the latest messages
     val isAtLatest by remember(listState) {
         derivedStateOf {
@@ -274,7 +307,7 @@ fun MessagesList(
         followIncomingMessages = isAtLatest
         onScrolledUpChanged?.invoke(!isAtLatest)
     }
-    
+
     // Force scroll to bottom when requested (e.g., when user sends a message)
     LaunchedEffect(forceScrollToBottom) {
         if (messages.isNotEmpty()) {
@@ -283,7 +316,7 @@ fun MessagesList(
             listState.scrollToItem(0)
         }
     }
-    
+
     // Recomputed only when the list actually gains or loses a message, and synchronously, so the
     // arriving item can read its cue during the same composition pass in which it first appears.
     // Reset per conversation, so a switch adopts the incoming messages silently instead of
@@ -449,13 +482,23 @@ fun MessageItem(
             // Delivery status for private messages (overlay, non-displacing). Bubble mode aligns
             // own messages to the end edge where this overlay lives, so it renders below instead.
             if (!bubbles && message.isPrivate && message.sender == currentUserNickname) {
-                message.deliveryStatus?.let { status ->
+                // If a status exists, show the checks. If not, show the sending spinner.
+                // This replaces the old ambiguous "two grey checks" baseline for in-flight messages.
+                if (message.deliveryStatus != null) {
                     Box(
                         modifier = Modifier
                             .align(Alignment.TopEnd)
                             .padding(top = 2.dp)
                     ) {
-                        DeliveryStatusIcon(status = status)
+                        DeliveryStatusIcon(status = message.deliveryStatus!!)
+                    }
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(top = 2.dp)
+                    ) {
+                        DeliverySendingSpinner()
                     }
                 }
             }
@@ -484,22 +527,22 @@ fun MessageItem(
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-    private fun MessageTextWithClickableNicknames(
-        message: BitchatMessage,
-        messages: List<BitchatMessage>,
-        currentUserNickname: String,
-        meshService: MeshService,
-        mentionPeerIdentities: Map<String, PeerIdentity>,
-        colorScheme: ColorScheme,
-        timeFormatter: SimpleDateFormat,
-        showSender: Boolean,
-        bubbles: Boolean = false,
-        onNicknameClick: ((String) -> Unit)?,
-        onMessageLongPress: ((BitchatMessage) -> Unit)?,
-        onCancelTransfer: ((BitchatMessage) -> Unit)?,
-        onImageClick: ((String, List<String>, Int) -> Unit)?,
-        modifier: Modifier = Modifier
-    ) {
+private fun MessageTextWithClickableNicknames(
+    message: BitchatMessage,
+    messages: List<BitchatMessage>,
+    currentUserNickname: String,
+    meshService: MeshService,
+    mentionPeerIdentities: Map<String, PeerIdentity>,
+    colorScheme: ColorScheme,
+    timeFormatter: SimpleDateFormat,
+    showSender: Boolean,
+    bubbles: Boolean = false,
+    onNicknameClick: ((String) -> Unit)?,
+    onMessageLongPress: ((BitchatMessage) -> Unit)?,
+    onCancelTransfer: ((BitchatMessage) -> Unit)?,
+    onImageClick: ((String, List<String>, Int) -> Unit)?,
+    modifier: Modifier = Modifier
+) {
     val palette = LocalBitchatPalette.current
 
     // Image special rendering
@@ -1038,9 +1081,14 @@ private fun BubbleTextMessageLayout(
                                     fontFamily = BitchatFontFamily,
                                 )
                                 if (message.isPrivate) {
-                                    message.deliveryStatus?.let { status ->
+                                    // If a deliveryStatus exists, show the checks.
+                                    // Otherwise show the sending spinner inline.
+                                    if (message.deliveryStatus != null) {
                                         Spacer(Modifier.width(4.dp))
-                                        DeliveryStatusIcon(status = status)
+                                        DeliveryStatusIcon(status = message.deliveryStatus!!)
+                                    } else {
+                                        Spacer(Modifier.width(4.dp))
+                                        DeliverySendingSpinner()
                                     }
                                 }
                             }
@@ -1104,6 +1152,10 @@ internal fun CashuPaymentChip(
     showActions: Boolean = true,
 ) {
     val context = LocalContext.current
+    // Capturado fuera del .semantics {} para evitar el falso positivo del linter:
+    // stringResource() es composable-safe y respeta cambios de idioma en runtime,
+    // a diferencia de context.getString() que requiere un Context vivo.
+    val cashuPaymentDescription = stringResource(R.string.cashu_payment_description)
     val info = remember(token) { CashuTokenDecoder.decode(token) }
     val primaryLabel = listOfNotNull(info?.displayAmount, info?.mintHost)
         .joinToString(" · ")
@@ -1128,7 +1180,7 @@ internal fun CashuPaymentChip(
                 )
                 .semantics {
                     contentDescription = buildString {
-                        append(context.getString(R.string.cashu_payment_description))
+                        append(cashuPaymentDescription)
                         append(": ")
                         append(primaryLabel)
                         info?.memo?.let { append(", $it") }
@@ -1202,22 +1254,46 @@ private fun redeemCashu(context: Context, token: String, preferWallet: Boolean) 
     runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(web))) }
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Delivery status — REDESIGN
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Antes: usaba `colorScheme.primary` como "verde" de éxito. Con el cambio de tema
+// (primary = azul), esa asociación se rompió. Ahora se consultan tokens semánticos
+// de `BitchatPalette`:
+//   - `messageSent`      (azul)  → mensaje aceptado por el transporte
+//   - `messageDelivered` (verde) → confirmación end-to-end
+//   - `messageFailed`    (rojo)  → fallo definitivo
+//
+// El color de "pending" (gris) sigue siendo `onSurface.copy(alpha = 0.35f)` porque no
+// tiene un token semántico propio.
+
 /**
  * Per-check target colours for the delivery marker.
  *
  * Both checks always render — grey (disabled) until an acknowledgement turns them on — so a
- * status change recolours in place and never reflows text around it. Read receipts use the
- * app's primary green rather than a separate accent. [status] == null yields the all-grey
- * baseline used while a message is still being sent.
+ * status change recolours in place and never reflows text around it.
+ *
+ * [status] == null no longer yields an all-grey baseline: it now triggers
+ * [DeliverySendingSpinner] instead, so the caller should not invoke this function with null.
+ * It is kept null-safe for compatibility.
  */
+@Composable
 private fun deliveryCheckColors(status: DeliveryStatus?, colorScheme: ColorScheme): Pair<Color, Color> {
+    val palette = LocalBitchatPalette.current
     val grey = colorScheme.onSurface.copy(alpha = 0.35f)
-    val green = colorScheme.primary
+    // Azul: mensaje aceptado localmente por el transporte.
+    val sent = palette.messageSent
+    // Verde: confirmación de entrega end-to-end.
+    val delivered = palette.messageDelivered
+    // Rojo: fallo tras reintentos.
+    val failed = palette.messageFailed
+
     return when (status) {
-        is DeliveryStatus.Read -> green to green
-        is DeliveryStatus.Delivered -> green to grey
-        is DeliveryStatus.PartiallyDelivered -> green to grey
-        is DeliveryStatus.Failed -> colorScheme.error to colorScheme.error
+        is DeliveryStatus.Read -> delivered to delivered
+        is DeliveryStatus.Delivered -> sent to delivered
+        is DeliveryStatus.PartiallyDelivered -> sent to grey
+        is DeliveryStatus.Failed -> failed to failed
         else -> grey to grey
     }
 }
@@ -1229,6 +1305,61 @@ private fun deliveryCheckRank(status: DeliveryStatus): Int = when (status) {
     is DeliveryStatus.PartiallyDelivered -> 2
     is DeliveryStatus.Failed -> 1
     else -> 0
+}
+
+/**
+ * DeliverySendingSpinner — indicador visual de "mensaje en vuelo".
+ *
+ * Antes, cuando un mensaje propio no tenía `deliveryStatus` (todavía en cola), se
+ * mostraban dos cheques grises ambiguos. Ahora se renderiza un spinner circular de
+ * 10dp que gira continuamente hasta que el mensaje recibe un estado real.
+ *
+ * Diseño: usa `Canvas` (de Compose Foundation) en vez de `CircularProgressIndicator`
+ * de Material 3 para mantener el tamaño exacto (10dp) y evitar la elevación implícita
+ * del componente de Material. El spinner consta de dos capas:
+ *   1. Un círculo base tenue (20% alpha).
+ *   2. Un arco de 90° que rota continuamente (55% alpha).
+ *
+ * Duración de rotación: 900ms por vuelta (LinearEasing, RepeatMode.Restart).
+ */
+@Composable
+internal fun DeliverySendingSpinner() {
+    val colorScheme = MaterialTheme.colorScheme
+    val transition = rememberInfiniteTransition(label = "sendingSpinner")
+    val rotation by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 900, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "sendingSpinnerRotation"
+    )
+
+    Canvas(modifier = Modifier.size(10.dp)) {
+        val stroke = 1.5.dp.toPx()
+        val radius = (size.minDimension - stroke) / 2f
+        val center = Offset(size.width / 2f, size.height / 2f)
+
+        // Círculo base tenue.
+        drawCircle(
+            color = colorScheme.onSurface.copy(alpha = 0.20f),
+            radius = radius,
+            center = center,
+            style = Stroke(width = stroke)
+        )
+
+        // Arco giratorio (90°).
+        drawArc(
+            color = colorScheme.onSurface.copy(alpha = 0.55f),
+            startAngle = rotation,
+            sweepAngle = 90f,
+            useCenter = false,
+            topLeft = Offset(center.x - radius, center.y - radius),
+            size = Size(radius * 2, radius * 2),
+            style = Stroke(width = stroke, cap = StrokeCap.Round)
+        )
+    }
 }
 
 @Composable
