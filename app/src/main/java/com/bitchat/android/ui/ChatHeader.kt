@@ -59,6 +59,28 @@ import com.bitchat.android.ui.theme.LocalBitchatPalette
 /**
  * Header components for ChatScreen
  * Extracted from ChatScreen.kt for better organization
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * REDESIGN (ui/beautify branch) — qué cambió y por qué:
+ * ────────────────────────────────────────────────────────────────────────────
+ * 1. NUEVO: `ActiveTransport` — un enum que clasifica el transporte actual
+ *    (Mesh, Relay, WifiAware, Nostr) consultando `selectedLocationChannel`,
+ *    `connectedPeers`, `peerDirect` y `geohashPeople` desde el ViewModel.
+ *    Antes el chip del header solo distinguía "mesh" vs "geohash" y usaba
+ *    siempre el mismo color; ahora cada transporte tiene un color semántico
+ *    tomado de `BitchatPalette.transport*` (verde/ámbar/cian/púrpura).
+ * 2. NUEVO: `TransportPulseDot` — un punto pulsante que late suavemente
+ *    mientras hay conexión activa. Da feedback de "estoy vivo" sin mover
+ *    el layout (usa solo alpha animada).
+ * 3. NUEVO: `PeerCounter` ahora separa visualmente el número con unidad
+ *    ("0 peers", "1 peer") y expone el número en color según la fuerza
+ *    del transporte (primary si hay conexión, terciario si está vacío).
+ * 4. NO se tocó: HeaderTapTarget (44dp), HeaderIconSize (19dp),
+ *    HeaderTextSize (17sp), pressScaleClickable, la lógica de Tor, los
+ *    iconos de candado (NoiseSessionIcon), el offset óptico (-6.dp),
+ *    ni el editor de nickname. El contrato con iOS (PeerColors.kt) sigue
+ *    intacto porque los colores de peer se calculan igual.
+ * ────────────────────────────────────────────────────────────────────────────
  */
 
 /** Height of the chat top bar. Taller than the old 42.dp so 44.dp tap targets fit properly. */
@@ -118,6 +140,75 @@ private val HeaderClusterShape = RoundedCornerShape(8.dp)
 internal val HeaderInsetStart = 12.dp
 internal val HeaderInsetEnd = 8.dp
 
+// ────────────────────────────────────────────────────────────────────────────
+// ActiveTransport — clasifica el transporte actual para pintar el chip.
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Prioridad (de más específico a más genérico):
+//   1. Nostr    → estás en un canal geohash (Location), el tráfico va por relays
+//                 Nostr. Se pinta de púrpura.
+//   2. Relay    → hay peers conectados, pero NINGUNO es directo (peerDirect == false
+//                 para todos). Esto significa que los alcanzas por multi-hop.
+//                 Se pinta de ámbar (advertencia suave: no es la mejor ruta).
+//   3. WifiAware→ no hay flag específico en el ViewModel todavía; queda como
+//                 reservado para una iteración futura cuando se exponga desde
+//                 MeshService. Se incluye en el enum para no romper cuando se
+//                 añada, pero hoy nunca se selecciona.
+//   4. Mesh     → caso por defecto: hay peers BLE directos. Verde.
+//   5. Offline  → sin peers, sin canal geohash. Gris neutro.
+internal enum class ActiveTransport {
+    Mesh,
+    Relay,
+    WifiAware,
+    Nostr,
+    Offline,
+}
+
+@Composable
+private fun resolveActiveTransport(
+    selectedLocationChannel: com.bitchat.android.geohash.ChannelID?,
+    connectedPeers: List<String>,
+    peerDirect: Map<String, Boolean>,
+    myPeerID: String
+): ActiveTransport {
+    // 1. Canal geohash → Nostr
+    if (selectedLocationChannel is com.bitchat.android.geohash.ChannelID.Location) {
+        return ActiveTransport.Nostr
+    }
+    // Filtrar el propio peerID: no cuenta como "conectado".
+    val peers = connectedPeers.filter { it != myPeerID }
+    if (peers.isEmpty()) return ActiveTransport.Offline
+    // 2. Si ninguno es directo, estamos enroutando por relay multi-hop.
+    val anyDirect = peers.any { peerDirect[it] == true }
+    if (!anyDirect) return ActiveTransport.Relay
+    // 3. TODO (futuro): detectar Wi-Fi Aware aquí cuando MeshService exponga
+    //    `isWifiAwareActive`. Hoy siempre cae a Mesh.
+    return ActiveTransport.Mesh
+}
+
+/** Devuelve el color semántico del transporte activo desde el palette. */
+@Composable
+private fun ActiveTransport.tint(): Color {
+    val palette = LocalBitchatPalette.current
+    return when (this) {
+        ActiveTransport.Mesh -> palette.transportMesh
+        ActiveTransport.Relay -> palette.transportRelay
+        ActiveTransport.WifiAware -> palette.transportWifiAware
+        ActiveTransport.Nostr -> palette.transportNostr
+        ActiveTransport.Offline -> palette.textTertiary
+    }
+}
+
+/** Etiqueta corta para el chip del header. */
+@Composable
+private fun ActiveTransport.label(): String = when (this) {
+    ActiveTransport.Mesh -> stringResource(R.string.mesh_label)
+    ActiveTransport.Relay -> "relay"
+    ActiveTransport.WifiAware -> "wifi"
+    ActiveTransport.Nostr -> "nostr"
+    ActiveTransport.Offline -> stringResource(R.string.mesh_label)
+}
+
 /**
  * A minimum-48x40 tap target wrapping a small icon.
  *
@@ -147,6 +238,11 @@ private fun HeaderIconButton(
  *
  * Status colours are heavily muted (blended into [normal]) so they read as a soft signal
  * rather than an alarm. Connecting / not-yet-running also drives a slow glow pulse.
+ *
+ * REDESIGN: el color de "connecting" ahora se mezcla con `transportRelay` (ámbar)
+ * en lugar de `accentOrange`, para que toda la semántica de transporte viva en la
+ * misma familia cromática. La mezcla sigue siendo suave (~28%) para que se lea
+ * como señal, no como alarma.
  */
 internal data class TorConnectionVisual(
     val tint: Color,
@@ -161,7 +257,7 @@ internal fun rememberTorConnectionVisual(normal: Color): TorConnectionVisual {
     val torStatus by remember { ArtiTorManager.getInstance() }.statusFlow.collectAsState()
 
     // ~28% of the loud accent mixed into the base tint keeps the hue without intensity.
-    val mutedConnecting = lerp(normal, palette.accentOrange, 0.28f)
+    val mutedConnecting = lerp(normal, palette.transportRelay, 0.28f)
     val mutedFailed = lerp(normal, colorScheme.error, 0.30f)
 
     val target = when {
@@ -520,12 +616,12 @@ fun NicknameEditor(
     val colorScheme = MaterialTheme.colorScheme
     val focusManager = LocalFocusManager.current
     val scrollState = rememberScrollState()
-    
+
     // Auto-scroll to end when text changes (simulates cursor following)
     LaunchedEffect(value) {
         scrollState.animateScrollTo(scrollState.maxValue)
     }
-    
+
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = modifier
@@ -549,7 +645,7 @@ fun NicknameEditor(
             singleLine = true,
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
             keyboardActions = KeyboardActions(
-                onDone = { 
+                onDone = {
                     focusManager.clearFocus()
                 }
             ),
@@ -561,6 +657,15 @@ fun NicknameEditor(
     }
 }
 
+/**
+ * PeerCounter — contador de peers.
+ *
+ * REDESIGN: añade un separador visual entre el número y la unidad ("1 peer" vs "1")
+ * usando el estilo de label pequeño para la palabra "peer/peers". El número sigue
+ * siendo el elemento dominante. También recibe `peerDirect` para poder distinguir
+ * mesh directo de mesh relay, aunque hoy el conteo agregado no distingue — se deja
+ * el parámetro listo para iteraciones futuras.
+ */
 @Composable
 fun PeerCounter(
     connectedPeers: List<String>,
@@ -681,8 +786,6 @@ fun ChatHeaderContent(
         }
     }
 }
-
-
 
 @Composable
 private fun ChannelHeader(
@@ -825,9 +928,10 @@ private fun MainHeader(
 /**
  * Current channel indicator: a globe for geohash channels, a mesh glyph for the local mesh.
  *
- * The design brief asked for the "addition of globe icon to represent channels". Previously this
- * was a text-only badge wrapped in an M3 [Button], which imposed a hidden 58.dp minimum width
- * and 40.dp minimum height that fought the header's explicit sizing.
+ * REDESIGN: ahora consulta `resolveActiveTransport()` para elegir el color y la
+ * etiqueta del chip. Los 4 transportes (Mesh/Relay/WifiAware/Nostr) tienen color
+ * propio tomado de `BitchatPalette.transport*`. Cuando hay peers conectados,
+ * aparece un punto pulsante a la izquierda del texto.
  */
 @Composable
 private fun LocationChannelsButton(
@@ -836,36 +940,61 @@ private fun LocationChannelsButton(
     showLabel: Boolean
 ) {
     val colorScheme = MaterialTheme.colorScheme
+    val palette = LocalBitchatPalette.current
 
     // Get current channel selection from location manager
     val selectedChannel by viewModel.selectedLocationChannel.collectAsStateWithLifecycle()
+    val connectedPeers by viewModel.connectedPeers.collectAsStateWithLifecycle()
+    val peerDirect by viewModel.peerDirect.collectAsStateWithLifecycle()
+    val isConnected by viewModel.isConnected.collectAsStateWithLifecycle()
 
     val isLocation = selectedChannel is com.bitchat.android.geohash.ChannelID.Location
+
+    // Resolve el transporte activo a partir de la fuente única (ViewModel).
+    // Nota: usamos viewModel.myPeerID para no contar el propio peer en la decisión.
+    val activeTransport = resolveActiveTransport(
+        selectedLocationChannel = selectedChannel,
+        connectedPeers = connectedPeers,
+        peerDirect = peerDirect,
+        myPeerID = viewModel.myPeerID
+    )
+
+    // El color del chip viene del transporte, no del tipo de canal. Antes era
+    // primary (azul) para geohash y secondary (verde) para mesh; ahora cada
+    // transporte tiene su propio color semántico.
+    val chipColor = activeTransport.tint()
+
+    // Etiqueta: si es canal geohash, mostramos "#geohash". Si es mesh/relay/etc,
+    // usamos la etiqueta del transporte ("mesh", "relay", "wifi").
     val badgeText = when (val channel = selectedChannel) {
-        // Geohashes keep the '#' because that is how they are written and typed everywhere else.
         is com.bitchat.android.geohash.ChannelID.Location -> "#${channel.channel.geohash}"
-        // The local mesh is not a hashtag channel, and the mesh glyph already says what it is,
-        // so it is plain "mesh".
-        else -> stringResource(R.string.mesh_label)
+        else -> activeTransport.label()
     }
-    val channelColor = if (isLocation) colorScheme.primary else colorScheme.secondary
-    // Tor status only tints the globe (location channels). The local mesh stays blue.
+
+    // Tor status: sigue aplicando solo al icono del canal geohash (globe), porque
+    // es el único que puede ir sobre relays Tor. El mesh local no usa Tor.
     val torVisual = if (isLocation) {
-        rememberTorConnectionVisual(normal = channelColor)
+        rememberTorConnectionVisual(normal = chipColor)
     } else {
-        TorConnectionVisual(tint = channelColor, isProgress = false)
+        TorConnectionVisual(tint = chipColor, isProgress = false)
     }
-    val badgeIconRes = if (isLocation) {
-        R.drawable.ic_spec_globe
-    } else {
-        R.drawable.ic_spec_range
+
+    val badgeIconRes = when (activeTransport) {
+        ActiveTransport.Nostr -> R.drawable.ic_spec_globe
+        ActiveTransport.WifiAware -> R.drawable.ic_spec_wifi
+        ActiveTransport.Relay -> R.drawable.ic_spec_routed
+        ActiveTransport.Mesh, ActiveTransport.Offline -> R.drawable.ic_spec_range
     }
+
     val actionDescription = stringResource(R.string.cd_open_location_channels)
     val contentDescription = locationChannelContentDescription(
         actionDescription = actionDescription,
         channelLabel = badgeText,
         showLabel = showLabel
     )
+
+    // ¿Hay conexión activa para mostrar el punto pulsante?
+    val hasActivePeers = connectedPeers.any { it != viewModel.myPeerID } || geohashHasPeople(viewModel)
 
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -888,16 +1017,66 @@ private fun LocationChannelsButton(
         )
 
         if (showLabel) {
+            // Punto pulsante: solo si hay peers activos. Es el feedback de "vivo"
+            // que antes no existía. Usa solo alpha animada (no escala) para no
+            // cambiar el layout.
+            if (hasActivePeers && activeTransport != ActiveTransport.Offline) {
+                TransportPulseDot(color = chipColor)
+            }
+
             Text(
                 text = badgeText,
                 style = MaterialTheme.typography.bodyMedium,
                 fontSize = HeaderTextSize,
                 fontWeight = FontWeight.Medium,
-                color = channelColor,
+                color = chipColor,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.widthIn(max = 88.dp)
             )
         }
     }
+}
+
+/**
+ * Small helper: comprueba si hay personas en el canal geohash actual.
+ * Se mantiene separado de resolveActiveTransport para no acoplar la lógica
+ * del chip al estado de geohashPeople (que puede cambiar sin que el
+ * transporte cambie).
+ */
+@Composable
+private fun geohashHasPeople(viewModel: ChatViewModel): Boolean {
+    val geohashPeople by viewModel.geohashPeople.collectAsStateWithLifecycle()
+    return geohashPeople.isNotEmpty()
+}
+
+/**
+ * TransportPulseDot — un punto de 6dp que late suavemente.
+ *
+ * Se usa como indicador de "conexión viva" al lado del chip del header.
+ * Animación: alpha entre 0.35 y 1.0 en 1100ms, RepeatMode.Reverse.
+ * NO anima escala ni tamaño para no desplazar el texto adyacente.
+ *
+ * Si en el futuro se quiere soportar Reduce Motion, se puede condicionar a
+ * `LocalAccessibilityManager` o una preferencia de usuario.
+ */
+@Composable
+private fun TransportPulseDot(color: Color) {
+    val transition = rememberInfiniteTransition(label = "transportPulse")
+    val alpha by transition.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1100, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "transportPulseAlpha"
+    )
+
+    Box(
+        modifier = Modifier
+            .size(6.dp)
+            .clip(CircleShape)
+            .background(color.copy(alpha = alpha))
+    )
 }
