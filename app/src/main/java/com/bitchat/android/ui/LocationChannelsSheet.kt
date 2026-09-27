@@ -5,7 +5,6 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
@@ -49,6 +48,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -97,7 +97,7 @@ import kotlinx.coroutines.withTimeoutOrNull
  *    puramente cosmético de nombres; los colores aplicados son los mismos.
  *
  * 2. Mesh dinámico. Antes el canal Mesh se pintaba siempre de verde
- *    (`secondary`), incluso con 0 peers. Ahora consulta `meshCount(viewModel)`:
+ *    (`secondary`), incluso con 0 peers. Ahora consulta `meshPeerCount`:
  *      - Si hay peers (> 0): `palette.transportMesh` (verde iOS #32D74B).
  *      - Si no hay peers: `colorScheme.onSurfaceVariant` (gris neutro).
  *    Esto es coherente con el chip del header (`ChatHeader.kt`), que también
@@ -111,14 +111,24 @@ import kotlinx.coroutines.withTimeoutOrNull
  * 4. Jerarquía visual en canales geohash. Antes TODOS los canales se pintaban
  *    del mismo color (`channelAccent`, azul). Ahora:
  *      - Canal seleccionado: `palette.transportNostr` (púrpura) + bold.
- *      - Canal con participantes (> 0): púrpura al 85% de alpha.
- *      - Canal inactivo sin participantes: `colorScheme.onSurface` (normal).
- *    Esto permite identificar de un vistazo qué canal está activo y cuáles
- *    tienen gente conectada.
+ *      - Canal con participantes (> 0): color por defecto, bold.
+ *      - Canal inactivo sin participantes: color por defecto, medium.
+ *
+ * 5. Lectura correcta de StateFlow. `meshPeerCount` se calcula leyendo
+ *    `viewModel.connectedPeers` con `collectAsStateWithLifecycle()` en vez de
+ *    `.value` durante la composición. Esto elimina el error de lint
+ *    "StateFlow.value should not be called within composition", respeta el
+ *    ciclo de vida del owner, y garantiza recomposición cuando cambian los
+ *    peers.
+ *
+ * 6. Placeholders de geohash con `pluralStringResource`. Se reemplazó
+ *    `context.resources.getQuantityString()` por `pluralStringResource()`,
+ *    que es la API composable-safe y elimina el falso positivo del linter
+ *    "Querying resource values using LocalContext.current".
  *
  * Sin cambios:
- *  - `SheetRowLeadingSlot`, `ChannelLeadingGutter`, `ChannelDividerInset`,
- *    `ChannelSelectedDot` (todos vienen de `AboutSheet.kt`).
+ *  - `SheetRowLeadingSlot`, `ChannelLeadingGutter`, `ChannelSelectedDot` (todos
+ *    vienen de `AboutSheet.kt`).
  *  - `SelectionConfirmDelayMs = 180L`.
  *  - `CustomGeohashRow` con su lógica de `bringIntoView` y `imePadding`.
  *  - Toda la lógica de `LocationChannelManager`, `GeohashBookmarksStore`,
@@ -137,7 +147,6 @@ private val ChannelLeadingSlot = SheetRowLeadingSlot
 private val ChannelLeadingGutter = SheetRowLeadingGutter
 private val ChannelRowHorizontal = SheetRowHorizontal
 private val ChannelRowVertical = SheetRowVertical
-private val ChannelDividerInset = SheetRowDividerInset
 /** 2× the previous 6.dp selected indicator; sits centered in [ChannelLeadingSlot]. */
 private val ChannelSelectedDot = SheetRowSelectedDot
 
@@ -186,6 +195,11 @@ fun LocationChannelsSheet(
     var customGeohash by remember { mutableStateOf("") }
     var customError by remember { mutableStateOf<String?>(null) }
 
+    // Capturado fuera del lambda para evitar el falso positivo del linter
+    // "Querying resource values using LocalContext.current". `stringResource`
+    // es la API composable-safe y respeta cambios de idioma en runtime.
+    val invalidGeohashMessage = stringResource(R.string.invalid_geohash)
+
     val teleportToGeohash: (String) -> Unit = { value ->
         val channel = channelForManualGeohash(value)
         if (channel != null) {
@@ -194,7 +208,7 @@ fun LocationChannelsSheet(
             onDismiss()
         } else {
             customGeohash = value.trim().lowercase().replace("#", "")
-            customError = context.getString(R.string.invalid_geohash)
+            customError = invalidGeohashMessage
         }
     }
 
@@ -202,16 +216,6 @@ fun LocationChannelsSheet(
     val coroutineScope = rememberCoroutineScope()
 
     val listState = rememberLazyListState()
-    val isScrolled by remember {
-        derivedStateOf {
-            listState.firstVisibleItemIndex > 0 || listState.firstVisibleItemScrollOffset > 0
-        }
-    }
-    val topBarAlpha by animateFloatAsState(
-        targetValue = if (isScrolled) 0.98f else 0f,
-        animationSpec = tween(BitchatMotion.EMPHASIZED_MS, easing = FastOutSlowInEasing),
-        label = "topBarAlpha"
-    )
 
     val mapPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -228,15 +232,20 @@ fun LocationChannelsSheet(
     val palette = LocalBitchatPalette.current
     // REDESIGN: renombrados para reflejar su rol semántico real.
     // `channelAccent` = azul (primary): canales geohash, red global.
-    // `meshAccent` = verde (secondary): mesh local BLE.
+    // `meshAccent` = verde (transportMesh): mesh local BLE.
     // Nota: los nombres anteriores (`standardGreen`/`standardBlue`) eran confusos
     // tras la Fase A, porque `primary` cambió de verde a azul.
     val channelAccent = colorScheme.primary
     val meshAccent = palette.transportMesh
-    // Número de peers mesh excluyendo al propio usuario. Se resuelve una vez aquí
+
+    // Leemos connectedPeers como estado reactivo, no como `.value` en composición.
+    // `collectAsStateWithLifecycle()` respeta el ciclo de vida y garantiza
+    // recomposición cuando cambia la lista de peers. Se resuelve una vez aquí
     // para no recomputar en cada uso (título, color, pulsing dot).
-    val meshPeerCount = remember(viewModel, viewModel.connectedPeers.value) {
-        meshCount(viewModel)
+    val connectedPeers by viewModel.connectedPeers.collectAsStateWithLifecycle()
+    val meshPeerCount = remember(connectedPeers, viewModel) {
+        val myID = viewModel.myPeerID
+        connectedPeers.count { it != myID }
     }
 
     val nearbyChannels = remember(availableChannels) {
@@ -1233,28 +1242,32 @@ private fun splitTitleAndCount(title: String): Pair<String, String?> {
     }
 }
 
+/**
+ * Título del canal "Mesh" con contador de peers.
+ *
+ * REDESIGN: en vez de leer `viewModel.connectedPeers.value` en composición (que
+ * dispara el error de lint "StateFlow.value should not be called within composition"),
+ * se colecciona el flow con `collectAsStateWithLifecycle()`. Además se reemplazó
+ * `context.resources.getQuantityString()` por `pluralStringResource()`, que es la
+ * API composable-safe y respeta cambios de idioma en runtime.
+ */
 @Composable
 private fun meshTitleWithCount(viewModel: ChatViewModel): String {
-    val meshCount = meshCount(viewModel)
-    val ctx = LocalContext.current
-    val peopleText = ctx.resources.getQuantityString(R.plurals.people_count, meshCount, meshCount)
+    val myID = viewModel.myPeerID
+    val connectedPeers by viewModel.connectedPeers.collectAsStateWithLifecycle()
+    val count = connectedPeers.count { it != myID }
+    val peopleText = pluralStringResource(R.plurals.people_count, count, count)
     val meshLabel = stringResource(R.string.mesh_title)
     return "$meshLabel$TITLE_COUNT_SEP$peopleText"
 }
 
-private fun meshCount(viewModel: ChatViewModel): Int {
-    val myID = viewModel.myPeerID
-    return viewModel.connectedPeers.value?.count { it != myID } ?: 0
-}
-
 @Composable
 private fun geohashTitleWithCount(channel: GeohashChannel, participantCount: Int): String {
-    val ctx = LocalContext.current
     val isHighPrecision = channel.level.precision > 5
     val peopleText = if (isHighPrecision && participantCount == 0) {
-        ctx.resources.getQuantityString(R.plurals.people_count, 0, 0).replace("0", "?")
+        pluralStringResource(R.plurals.people_count, 0, 0).replace("0", "?")
     } else {
-        ctx.resources.getQuantityString(R.plurals.people_count, participantCount, participantCount)
+        pluralStringResource(R.plurals.people_count, participantCount, participantCount)
     }
     val levelName = when (channel.level) {
         GeohashChannelLevel.BUILDING -> "Building"
@@ -1269,13 +1282,12 @@ private fun geohashTitleWithCount(channel: GeohashChannel, participantCount: Int
 
 @Composable
 private fun geohashHashTitleWithCount(geohash: String, participantCount: Int): String {
-    val ctx = LocalContext.current
     val level = levelForLength(geohash.length)
     val isHighPrecision = level.precision > 5
     val peopleText = if (isHighPrecision && participantCount == 0) {
-        ctx.resources.getQuantityString(R.plurals.people_count, 0, 0).replace("0", "?")
+        pluralStringResource(R.plurals.people_count, 0, 0).replace("0", "?")
     } else {
-        ctx.resources.getQuantityString(R.plurals.people_count, participantCount, participantCount)
+        pluralStringResource(R.plurals.people_count, participantCount, participantCount)
     }
     return "#$geohash$TITLE_COUNT_SEP$peopleText"
 }
