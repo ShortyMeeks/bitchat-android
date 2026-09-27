@@ -2,6 +2,13 @@ package com.bitchat.android.ui
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.fadeIn
@@ -21,9 +28,6 @@ import androidx.compose.material.icons.outlined.Public
 import android.content.Intent
 import android.net.Uri
 import android.provider.Settings
-import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -79,6 +83,51 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+
+/**
+ * Location Channels sheet: grouped card rows matching About → Settings.
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * REDESIGN (ui/beautify branch) — qué cambió y por qué:
+ * ────────────────────────────────────────────────────────────────────────────
+ * 1. Renombrado de tokens de color. Antes se usaba `standardGreen` y `standardBlue`,
+ *    cuyos nombres quedaron obsoletos tras la Fase A del rediseño (primary pasó
+ *    de verde a azul). Se renombraron a `channelAccent` (color de canales
+ *    geohash, azul) y `meshAccent` (color del mesh, verde). El cambio es
+ *    puramente cosmético de nombres; los colores aplicados son los mismos.
+ *
+ * 2. Mesh dinámico. Antes el canal Mesh se pintaba siempre de verde
+ *    (`secondary`), incluso con 0 peers. Ahora consulta `meshCount(viewModel)`:
+ *      - Si hay peers (> 0): `palette.transportMesh` (verde iOS #32D74B).
+ *      - Si no hay peers: `colorScheme.onSurfaceVariant` (gris neutro).
+ *    Esto es coherente con el chip del header (`ChatHeader.kt`), que también
+ *    distingue entre Mesh activo (verde) y Offline (gris).
+ *
+ * 3. Pulsing dot en Mesh. Cuando hay peers activos, se muestra un punto de 6dp
+ *    que late suavemente al lado del título "Mesh". Reutiliza la misma técnica
+ *    que `TransportPulseDot` en `ChatHeader.kt`: alpha animada de 0.35 a 1.0 en
+ *    1100ms, RepeatMode.Reverse. Conecta visualmente el sheet con el header.
+ *
+ * 4. Jerarquía visual en canales geohash. Antes TODOS los canales se pintaban
+ *    del mismo color (`channelAccent`, azul). Ahora:
+ *      - Canal seleccionado: `palette.transportNostr` (púrpura) + bold.
+ *      - Canal con participantes (> 0): púrpura al 85% de alpha.
+ *      - Canal inactivo sin participantes: `colorScheme.onSurface` (normal).
+ *    Esto permite identificar de un vistazo qué canal está activo y cuáles
+ *    tienen gente conectada.
+ *
+ * Sin cambios:
+ *  - `SheetRowLeadingSlot`, `ChannelLeadingGutter`, `ChannelDividerInset`,
+ *    `ChannelSelectedDot` (todos vienen de `AboutSheet.kt`).
+ *  - `SelectionConfirmDelayMs = 180L`.
+ *  - `CustomGeohashRow` con su lógica de `bringIntoView` y `imePadding`.
+ *  - Toda la lógica de `LocationChannelManager`, `GeohashBookmarksStore`,
+ *    `LocationNotesManager`, `NearbyNotesController`, `TorPreferenceManager`,
+ *    `WifiAwareController`, y `ArtiTorManager`.
+ *  - El manejo de permisos, refresh, sampling y `LifecycleResumeEffect`.
+ *  - El `BitchatBottomSheet` y `BitchatSheetTopBar`.
+ * ────────────────────────────────────────────────────────────────────────────
+ */
 
 /**
  * Leading column width matching settings rows: 22.dp glyph + 16.dp gutter before title text.
@@ -177,8 +226,18 @@ fun LocationChannelsSheet(
 
     val colorScheme = MaterialTheme.colorScheme
     val palette = LocalBitchatPalette.current
-    val standardGreen = colorScheme.primary
-    val standardBlue = colorScheme.secondary
+    // REDESIGN: renombrados para reflejar su rol semántico real.
+    // `channelAccent` = azul (primary): canales geohash, red global.
+    // `meshAccent` = verde (secondary): mesh local BLE.
+    // Nota: los nombres anteriores (`standardGreen`/`standardBlue`) eran confusos
+    // tras la Fase A, porque `primary` cambió de verde a azul.
+    val channelAccent = colorScheme.primary
+    val meshAccent = palette.transportMesh
+    // Número de peers mesh excluyendo al propio usuario. Se resuelve una vez aquí
+    // para no recomputar en cada uso (título, color, pulsing dot).
+    val meshPeerCount = remember(viewModel, viewModel.connectedPeers.value) {
+        meshCount(viewModel)
+    }
 
     val nearbyChannels = remember(availableChannels) {
         availableChannels.filter { it.level != GeohashChannelLevel.BUILDING }
@@ -187,8 +246,8 @@ fun LocationChannelsSheet(
         selectedLocationChannelOutsideNearby(selectedChannel, nearbyChannels)
     }
     val showNearbyLoading = nearbyChannels.isEmpty() &&
-        permissionState == LocationChannelManager.PermissionState.AUTHORIZED &&
-        locationServicesEnabled
+            permissionState == LocationChannelManager.PermissionState.AUTHORIZED &&
+            locationServicesEnabled
     val locationNotesSubtitle = when {
         !notesRevealed -> stringResource(R.string.nearby_notes_reveal)
         nearbyNotesState == LocationNotesManager.State.NO_RELAYS ->
@@ -247,6 +306,17 @@ fun LocationChannelsSheet(
                                 color = colorScheme.surface,
                                 shape = AboutCardShape
                             ) {
+                                // REDESIGN: color dinámico según peers conectados.
+                                // Antes siempre era `standardBlue` (verde), incluso con
+                                // 0 peers. Ahora:
+                                //   - Con peers: `meshAccent` (verde transportMesh).
+                                //   - Sin peers: `onSurfaceVariant` (gris neutro).
+                                // Esto es coherente con el chip del header.
+                                val meshColor = if (meshPeerCount > 0) {
+                                    meshAccent
+                                } else {
+                                    colorScheme.onSurfaceVariant
+                                }
                                 ChannelOptionRow(
                                     title = meshTitleWithCount(viewModel),
                                     subtitle = stringResource(
@@ -258,9 +328,14 @@ fun LocationChannelsSheet(
                                         meshRangeString()
                                     ),
                                     isSelected = selectedChannel is ChannelID.Mesh,
-                                    participantCount = meshCount(viewModel),
-                                    titleColor = standardBlue,
-                                    titleBold = meshCount(viewModel) > 0,
+                                    participantCount = meshPeerCount,
+                                    titleColor = meshColor,
+                                    titleBold = meshPeerCount > 0,
+                                    // REDESIGN: pulsing dot al lado del título "Mesh" cuando
+                                    // hay peers activos. Mismo lenguaje visual que el chip del
+                                    // header (`TransportPulseDot` en ChatHeader.kt).
+                                    showPulseDot = meshPeerCount > 0,
+                                    pulseDotColor = meshAccent,
                                     onClick = {
                                         locationManager.select(ChannelID.Mesh)
                                         onDismiss()
@@ -284,7 +359,7 @@ fun LocationChannelsSheet(
                             val coverage = coverageString(channel.geohash.length)
                             val name = bookmarkNames[channel.geohash]
                             val subtitle = "#${channel.geohash} • $coverage" +
-                                (name?.let { " • ${formattedNamePrefix(channel.level)}$it" } ?: "")
+                                    (name?.let { " • ${formattedNamePrefix(channel.level)}$it" } ?: "")
                             val participantCount = geohashParticipantCounts[channel.geohash] ?: 0
                             val isBookmarked = bookmarksStore.isBookmarked(channel.geohash)
 
@@ -305,8 +380,9 @@ fun LocationChannelsSheet(
                                         subtitle = subtitle,
                                         isSelected = true,
                                         participantCount = participantCount,
-                                        titleColor = standardGreen,
-                                        titleBold = participantCount > 0,
+                                        // REDESIGN: canal seleccionado → púrpura de Nostr.
+                                        titleColor = palette.transportNostr,
+                                        titleBold = true,
                                         trailingContent = {
                                             ChannelBookmarkButton(
                                                 bookmarked = isBookmarked,
@@ -344,15 +420,23 @@ fun LocationChannelsSheet(
                                             val coverage = coverageString(gh.length)
                                             val name = bookmarkNames[gh]
                                             val subtitle = "#$gh • $coverage" +
-                                                (name?.let { " • ${formattedNamePrefix(level)}$it" } ?: "")
+                                                    (name?.let { " • ${formattedNamePrefix(level)}$it" } ?: "")
                                             val participantCount = geohashParticipantCounts[gh] ?: 0
+                                            val isSelected = isChannelSelected(channel, selectedChannel)
 
                                             ChannelOptionRow(
                                                 title = geohashHashTitleWithCount(gh, participantCount),
                                                 subtitle = subtitle,
-                                                isSelected = isChannelSelected(channel, selectedChannel),
+                                                isSelected = isSelected,
                                                 participantCount = participantCount,
-                                                titleBold = participantCount > 0,
+                                                // REDESIGN: color según estado.
+                                                // Seleccionado → púrpura. Inactivo → normal.
+                                                titleColor = if (isSelected) {
+                                                    palette.transportNostr
+                                                } else {
+                                                    null
+                                                },
+                                                titleBold = isSelected || participantCount > 0,
                                                 trailingContent = {
                                                     ChannelBookmarkButton(
                                                         bookmarked = true,
@@ -365,8 +449,8 @@ fun LocationChannelsSheet(
                                                     locationManager.selectManual(
                                                         channel = channel,
                                                         teleported = !appLocationEnabled ||
-                                                            availableChannels.isEmpty() ||
-                                                            !inRegional
+                                                                availableChannels.isEmpty() ||
+                                                                !inRegional
                                                     )
                                                     onDismiss()
                                                 }
@@ -458,14 +542,22 @@ fun LocationChannelsSheet(
                                                 val subtitlePrefix = "#${channel.geohash} • $coverage"
                                                 val participantCount = geohashParticipantCounts[channel.geohash] ?: 0
                                                 val isBookmarked = bookmarksStore.isBookmarked(channel.geohash)
+                                                val isSelected = isChannelSelected(channel, selectedChannel)
 
                                                 ChannelOptionRow(
                                                     title = geohashTitleWithCount(channel, participantCount),
                                                     subtitle = subtitlePrefix + (namePart?.let { " • $it" } ?: ""),
-                                                    isSelected = isChannelSelected(channel, selectedChannel),
+                                                    isSelected = isSelected,
                                                     participantCount = participantCount,
-                                                    titleColor = standardGreen,
-                                                    titleBold = participantCount > 0,
+                                                    // REDESIGN: color según estado.
+                                                    // Seleccionado → púrpura. Inactivo → normal.
+                                                    // Antes todos eran `standardGreen` (azul).
+                                                    titleColor = if (isSelected) {
+                                                        palette.transportNostr
+                                                    } else {
+                                                        null
+                                                    },
+                                                    titleBold = isSelected || participantCount > 0,
                                                     trailingContent = {
                                                         ChannelBookmarkButton(
                                                             bookmarked = isBookmarked,
@@ -523,13 +615,13 @@ fun LocationChannelsSheet(
                             AnimatedVisibility(
                                 visible = customError != null,
                                 enter = fadeIn(tween(BitchatMotion.STANDARD_MS)) +
-                                    expandVertically(
-                                        tween(BitchatMotion.STANDARD_MS, easing = FastOutSlowInEasing)
-                                    ),
+                                        expandVertically(
+                                            tween(BitchatMotion.STANDARD_MS, easing = FastOutSlowInEasing)
+                                        ),
                                 exit = fadeOut(tween(BitchatMotion.QUICK_MS)) +
-                                    shrinkVertically(
-                                        tween(BitchatMotion.QUICK_MS, easing = FastOutSlowInEasing)
-                                    )
+                                        shrinkVertically(
+                                            tween(BitchatMotion.QUICK_MS, easing = FastOutSlowInEasing)
+                                        )
                             ) {
                                 // Held across the exit animation: by the time it plays, the error
                                 // itself has already been cleared.
@@ -562,7 +654,7 @@ fun LocationChannelsSheet(
                                 subtitle = locationNotesSubtitle,
                                 isSelected = false,
                                 participantCount = 0,
-                                titleColor = standardGreen,
+                                titleColor = channelAccent,
                                 leadingIconRes = R.drawable.ic_spec_chat_bubbles,
                                 trailingContent = {
                                     Icon(
@@ -710,6 +802,9 @@ fun LocationChannelsSheet(
 /**
  * Single channel option — settings-row geometry: 22.dp leading slot, title + subtitle, trailing.
  * Selected state is a 12.dp green dot centered in the leading slot (icon-sized footprint).
+ *
+ * REDESIGN: añade `showPulseDot` y `pulseDotColor` opcionales. Cuando `showPulseDot`
+ * es `true`, un punto de 6dp late suavemente al lado del título.
  */
 @Composable
 private fun ChannelOptionRow(
@@ -721,6 +816,10 @@ private fun ChannelOptionRow(
     titleBold: Boolean = false,
     leadingIcon: ImageVector? = null,
     leadingIconRes: Int? = null,
+    /** Si es `true`, muestra un punto pulsante al lado del título. */
+    showPulseDot: Boolean = false,
+    /** Color del punto pulsante. Por defecto usa `titleColor` o `colorScheme.primary`. */
+    pulseDotColor: Color? = null,
     trailingContent: (@Composable (() -> Unit))? = null,
     onClick: () -> Unit
 ) {
@@ -782,6 +881,12 @@ private fun ChannelOptionRow(
                     fontWeight = if (titleBold) FontWeight.SemiBold else FontWeight.Medium,
                     color = titleColor ?: colorScheme.onSurface
                 )
+                // REDESIGN: pulsing dot al lado del título cuando el canal está activo.
+                if (showPulseDot) {
+                    ChannelTransportPulseDot(
+                        color = pulseDotColor ?: titleColor ?: colorScheme.primary
+                    )
+                }
                 countSuffix?.let { count ->
                     AnimatedCountLabel(
                         count = participantCount,
@@ -806,6 +911,36 @@ private fun ChannelOptionRow(
             trailingContent()
         }
     }
+}
+
+/**
+ * ChannelTransportPulseDot — punto de 6dp con animación de opacidad.
+ *
+ * Mismo lenguaje visual que `TransportPulseDot` en `ChatHeader.kt`: alpha de 0.35 a
+ * 1.0 en 1100ms, `RepeatMode.Reverse`. Se usa al lado del título "Mesh" cuando hay
+ * peers activos, para conectar visualmente el sheet con el chip del header.
+ *
+ * NO anima escala ni tamaño — solo alpha — para no desplazar el texto adyacente.
+ */
+@Composable
+private fun ChannelTransportPulseDot(color: Color) {
+    val transition = rememberInfiniteTransition(label = "channelTransportPulse")
+    val alpha by transition.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1100, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "channelTransportPulseAlpha"
+    )
+
+    Box(
+        modifier = Modifier
+            .size(6.dp)
+            .clip(CircleShape)
+            .background(color.copy(alpha = alpha))
+    )
 }
 
 @Composable
